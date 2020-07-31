@@ -1,0 +1,334 @@
+---
+title: "Investing_Portfolio_Model"
+output: html_notebook
+Author: Antonio Martin-Cobos | Data Analytics Manager
+---
+
+The purpose of this project is to provide advice for investors looking to build a diversified porfolio of high quality stocks, following a mixed dividend strategy based on dividend growth and dividend yield.
+
+In order to achieve the above we'll be using curated data from 3 different sites:
+
+1. Dividend radar from Jim's website (site https://www.portfolio-insight.com/dividend-radar)
+2. Stock information from Quantmod
+3. Dividend aristocrats data from FerdiS (https://seekingalpha.com/author/ferdis#regular_articles) (site https://divgro.blogspot.com/p/portfolio.html)
+
+
+I do not own not I'm involved in the creation or maintenance of any of the above sources, nor I am claiming any recognition for the work done in order to compile and put together all that useful information. The only purpose of this project is exclusively to combine as many sources of financial and quality information as possible in order to facilitate the analysis of all underlying stocks.
+
+I am not either an investment professional or a licensed financial advisor, and the logics or algorithms that may be used in this project represent exclusively my personal opinion and judgement. By any means the final results and outputs of this project should be considered investment-grade advice and any investment decision must be throroughly considered by every investor individually.
+
+For any comments, questions or suggestions you can reac out to me through LinkedIn: https://linkedin.com/in/antoniomcb
+
+
+Libraries:
+
+```{r eval=FALSE, include=FALSE}
+install.packages("readxl")
+install.packages("tidyverse")
+install.packages("data.table")
+install.packages("tidyquant")
+install.packages("dplyr")
+install.packages("rlang")
+install.packages("rvest")
+install.packages("glue")
+install.packages("RSelenium")
+install.packages("ggpubr")
+install.packages("gsheet")
+install.packages("xlsReadWrite")
+
+
+#old.packages()
+#update.packages()
+```
+
+```{r include=FALSE}
+library(quantmod)
+library(tidyquant)
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(gsheet)
+library(readr)
+
+```
+
+
+
+
+Our first source of data is the Dividend Radar from https://www.portfolio-insight.com/dividend-radar. 
+
+We need to import an Excel file whose name is dynamic based on the latest date they updated the file. Example:
+
+https://publications-radar-2020.nyc3.cdn.digitaloceanspaces.com/Dividend%20Radar%202020-07-17.xlsx
+
+Notice the date at the end.
+
+Detailed explanation on all data fields available in this source here:
+
+https://publications-radar-support.nyc3.cdn.digitaloceanspaces.com/Dividend%20Radar%20Data%20Dictionary%20v1.0.0.pdf
+
+```{r include=FALSE}
+
+dates <- seq(Sys.Date()-7, Sys.Date()-1, by="1 day")
+last_friday <- dates[weekdays(dates) == "Friday"]
+
+dividend_data_source_path <- "https://publications-radar-2020.nyc3.cdn.digitaloceanspaces.com/Dividend Radar "
+dividend_data_source <- paste(dividend_data_source_path, last_friday, ".xlsx", sep = "")
+dividend_data_file <- paste(getwd(), "/dividend_data.xlsx", sep = "")
+
+if (file.exists(dividend_data_file)) 
+  #Delete file if it exists
+  file.remove(dividend_data_file)
+
+download.file(dividend_data_source, dividend_data_file, mode = "wb")
+
+dividend_data <- read_excel(dividend_data_file, sheet = "All", col_names = TRUE, skip = 2)
+```
+
+
+
+
+The second piece of data we need is the value metrics from Yahoo. For this source we use GetQuote from Quantmod and an input vector list from the previous data frame.
+
+It's worth mentioning that Quanmod package seems not to work fine with tickers that have a dot "." in their code so we'll filter these out.
+
+```{r}
+watchlist <- dividend_data[["Symbol"]] %>% str_subset("[.]", negate = TRUE)
+
+
+value_data <- getQuote(watchlist, what = yahooQF(c("Symbol", "Last Trade (Price Only)", "P/E Ratio", "Price/EPS Estimate Next Year", "Earnings/Share", "EPS Forward", "Price/Book")))
+```
+
+
+
+
+Once we've got both pieces of data we need to join them into a single table:
+
+```{r}
+
+filter_columns <- c("Symbol", "Company", "Sector", "Industry", "No Years", "Price", "Div Yield", "DGR 1Y", "DGR 3Y", "DGR 5Y", "DGR 10Y", "TTR 1Y", "TTR 3Y", "Fair Value", "EPS 1Y", "Revenue 1Y", "CF/Share", "ROE", "Debt/Capital", "P/E", "P/E Ratio", "Price/EPS Estimate Next Year", "PEG", "P/BV", "Price/Book")
+
+stock_data <- merge(dividend_data, value_data, by.x="Symbol", by.y="Symbol", all.x=TRUE) %>% select(filter_columns)
+```
+
+
+
+
+Another interesting source of data is the financial strenght, moat, S&P rating and dividend safety rating for all the dividend aristocrats.
+
+ref: https://docs.google.com/spreadsheets/d/1TMtyr6pr4S6GcLcl03VI--vG3PkLf7arOkjEovT1eFA/edit#gid=1275310529
+ref: https://divgro.blogspot.com/p/portfolio.html
+
+```{r}
+
+quality_data_url <- 'https://docs.google.com/spreadsheets/d/1TMtyr6pr4S6GcLcl03VI--vG3PkLf7arOkjEovT1eFA/edit#gid=522671675'
+
+quality_data <- read_csv(construct_download_url(quality_data_url), skip=2, skip_empty_rows = TRUE) %>% select(-X5, -X7, -X10, -X14, -X20, -Yrs, -Yield, -`5-Yr DGR`, -`Recent Stock Price`)
+
+quality_data$`FV (Disc) Prem` <- str_replace_all(quality_data$`FV (Disc) Prem`, '[(]', '-') %>% str_replace_all('[%)]', '') %>% as.numeric()
+
+stock_data <- merge(stock_data, quality_data %>% select(-Company, -Sector), by.x="Symbol", by.y="Ticker", all.x=TRUE)
+
+```
+
+
+
+
+Now we've got our data ready. It's time to start selecting those that may be cadidates to buy.
+
+We're going to set several thresholds for some of the metrics and filter out candidate list:
+
+```{r}
+
+#filter selection for high yield companies:
+
+no_years <- 10
+div_yield <- 4
+dgr1 <- 1.5
+dgr3 <- 2
+dgr5 <- 2
+dgr10 <- 2
+e_share <- -30
+r_share <- -10
+cf_share <- 0
+pe <- 25
+fpe <- 20
+peg <- 5
+
+#Dividend filters. We're looking for high yield with a lower limit of at least 3 years of reasonable growth
+stock_data_yield <- stock_data %>% filter(`No Years` >= no_years, `Div Yield` > div_yield, `DGR 1Y` > dgr1, `DGR 3Y` > dgr3, (`DGR 5Y` > dgr5 | is.na(`DGR 5Y`) == TRUE), (`DGR 10Y` > dgr10 | is.na(`DGR 10Y`) == TRUE))
+
+#Value filters. We're looking for undervalued or fairly valued cases, although we'll include outliers as this data is sometimes low quality
+#REITs function financially in a very different way than traditional businesses so we'll avoid applying te same filters we use for non REITs
+stock_data_yield <- stock_data_yield %>% filter(`Fair Value` != 'Above Fair Value', (`P/E` < pe | `P/E` > 35 | `Sector` == "Real Estate"), (stock_data_yield$"Price/EPS Estimate Next Year" < fpe | is.na(stock_data_yield$"Price/EPS Estimate Next Year") == TRUE | `Price/EPS Estimate Next Year` > 30 | `Sector` == "Real Estate"), (`PEG` < peg | is.na(`PEG` | `PEG` > 10) == TRUE))
+
+#Financial filters. EPS and Revenue columns are actually growth figures (percentages) so we can establish a normalised threshold
+#to be defined based on current economic conditions. Cash Flow figure however is absolute number (dollars per share) so we want that always above zero.
+stock_data_yield <- stock_data_yield %>% filter(`EPS 1Y` >= e_share, `Revenue 1Y` >= r_share, `CF/Share` >= cf_share)
+
+
+
+#filter selection for high dividend growth companies:
+
+div_yield <- 1.5
+dgr1 <- 7
+dgr3 <- 8
+dgr5 <- 9
+dgr10 <- 9
+e_share <- -25
+r_share <- -10
+cf_share <- 0
+pe <- 35
+fpe <- 25
+peg <- 2.5
+
+#Dividend filters. We're looking for strong dividend growth history for as many years as available, with a lower limit of at least 3 years of growth
+stock_data_DG <- stock_data %>% filter(`No Years` >= no_years, `Div Yield` > div_yield, `DGR 1Y` > dgr1, `DGR 3Y` > dgr3, (`DGR 5Y` > dgr5 | is.na(`DGR 5Y`) == TRUE), (`DGR 10Y` > dgr10 | is.na(`DGR 10Y`) == TRUE))
+
+#Value filters. We're looking for undervalued or fairly valued cases, although we include outliers as this data is sometimes low quality
+stock_data_DG <- stock_data_DG %>% filter(`Fair Value` != 'Above Fair Value', (`P/E` < pe | `P/E` > 35 | `Sector` == "Real Estate"), (`Price/EPS Estimate Next Year` < fpe | is.na(`Price/EPS Estimate Next Year`) == TRUE | `Price/EPS Estimate Next Year` > 30 | `Sector` == "Real Estate"), (`PEG` < peg | is.na(`PEG` | `PEG` > 10) == TRUE))
+
+#Financial filters. EPS and Revenue columns are actually growth figures (percentages) so we can establish a normalised threshold
+#to be defined based on current economic conditions. Cash Flow figure however is absolute number (dollars per share) so we want that always above zero.
+stock_data_DG <- stock_data_DG %>% filter(`EPS 1Y` >= e_share, `Revenue 1Y` >= r_share, `CF/Share` >= cf_share)
+```
+
+
+
+
+With all this data now we can display our options for visual analysis:
+
+```{r}
+
+d1 <- stock_data_yield %>% group_by(Sector, Industry) %>% summarise(Candidates = n())
+
+p1 <-  d1 %>% group_by(Sector) %>% summarise(TotalCandidates = sum(Candidates)) %>% ggplot(aes(x=reorder(Sector, TotalCandidates), y=TotalCandidates)) + geom_bar(position="stack", stat="identity",color='steelblue', fill="skyblue") + geom_text(aes(label=TotalCandidates), hjust=1.6, color="black", size=4) + labs(x="Number of candidates", y="Sector") + ggtitle("Candidates", "by Sector") + coord_flip() + theme_classic()
+p1
+
+p2 <-  d1 %>% group_by(Industry) %>% summarise(TotalCandidates = sum(Candidates)) %>% ggplot(aes(x=reorder(Industry, TotalCandidates), y=TotalCandidates)) + geom_bar(position="stack", stat="identity",color='steelblue', fill="skyblue") + geom_text(aes(label=TotalCandidates), hjust=1.6, color="black", size=4) + labs(x="Number of candidates", y="Industry") + ggtitle("Candidates", "by Industry") + coord_flip() + theme_classic()
+p2
+
+p3 <- d1 %>% ggbarplot(x="Sector", y="Candidates", color="Industry", fill="Industry", label=FALSE, lab.pos="in", lab.vjust=1,  lab.col="white", legend="right", ggtheme = theme_pubclean()) + coord_flip() + theme(legend.text = element_text(size = 8))
+p3
+
+p4 <- stock_data_yield %>% ggplot(aes(x=`Div Yield`, y=`P/E`, label = Symbol)) + geom_point() + geom_point() + geom_text_repel()
+p4
+
+
+
+d2 <- stock_data_DG %>% group_by(Sector, Industry) %>% summarise(Candidates = n())
+
+p11 <-  d2 %>% group_by(Sector) %>% summarise(TotalCandidates = sum(Candidates)) %>% ggplot(aes(x=reorder(Sector, TotalCandidates), y=TotalCandidates)) + geom_bar(position="stack", stat="identity",color='steelblue', fill="skyblue") + geom_text(aes(label=TotalCandidates), hjust=1.6, color="black", size=4) + labs(x="Number of candidates", y="Sector") + ggtitle("Candidates", "by Sector") + coord_flip() + theme_classic()
+p11
+
+p12 <-  d2 %>% group_by(Industry) %>% summarise(TotalCandidates = sum(Candidates)) %>% ggplot(aes(x=reorder(Industry, TotalCandidates), y=TotalCandidates)) + geom_bar(position="stack", stat="identity",color='steelblue', fill="skyblue") + geom_text(aes(label=TotalCandidates), hjust=1.6, color="black", size=4) + labs(x="Number of candidates", y="Industry") + ggtitle("Candidates", "by Industry") + coord_flip() + theme_classic()
+p12
+
+p13 <- d2 %>% ggbarplot(x="Sector", y="Candidates", color="Industry", fill="Industry", label=FALSE, lab.pos="in", lab.vjust=1,  lab.col="white", legend="right", ggtheme = theme_pubclean()) + coord_flip() + theme(legend.text = element_text(size = 8)) + geom_point()
+p13
+
+
+```
+
+
+
+
+Still we need to refine the candidate list a little further. We're going to create an extra metric and select the top companies from a high yield perspective and from dividend growth perspective that we will consolidate later:
+
+```{r}
+
+stock_data_yield <- stock_data_yield %>% mutate(AvgDG=rowMeans(cbind(`DGR 1Y`, `DGR 3Y`, `DGR 5Y`, `DGR 10Y`), na.rm=T))
+
+stock_data_DG <- stock_data_DG %>% mutate(AvgDG=rowMeans(cbind(`DGR 1Y`, `DGR 3Y`, `DGR 5Y`, `DGR 10Y`), na.rm=T))
+
+
+
+stock_data_yield_selected <- stock_data_yield %>% filter(`Div Yield`>(mean(`Div Yield`)*0.8)) %>% filter(`EPS 1Y`>(mean(`EPS 1Y`)*0.8))
+
+stock_data_DG_selected <- stock_data_DG %>% filter(AvgDG>(mean(AvgDG))*0.9) %>% filter(PEG<(mean(PEG))*1.2) %>% filter(`No Years`>(mean(`No Years`))*0.8)
+
+```
+
+
+
+
+Also, we're going to provide another selection list based exclusively on dividend aristocrats. The fields we're interested in are dividend safety, financial strenght and FV potential:
+
+```{r}
+
+p21 <- quality_data  %>% group_by(Sector, `M* Economic Moat`) %>% summarise(Candidates = n()) %>% ggbarplot(x="Sector", y="Candidates", color="M* Economic Moat", fill="M* Economic Moat", label=FALSE, legend="right", ggtheme = theme_pubclean()) + coord_flip() + theme(legend.text = element_text(size = 8))
+p21
+
+p22 <- quality_data  %>% group_by(Sector, `SSD Dividend Safety`) %>% summarise(Candidates = n()) %>% ggbarplot(x="Sector", y="Candidates", color="SSD Dividend Safety", fill="SSD Dividend Safety", label=FALSE, legend="right", ggtheme = theme_pubclean(), order=) + coord_flip() + theme(legend.text = element_text(size = 8))
+p22
+
+p23 <- quality_data  %>% group_by(Sector, `FV (Disc) Prem`) %>% summarise(Candidates = n()) %>% ggbarplot(x="Sector", y="Candidates", color=rev("FV (Disc) Prem"), fill=rev("FV (Disc) Prem"), label=FALSE, lab.pos="in", lab.vjust=1,  lab.col="white", legend="right", ggtheme = theme_pubclean()) + coord_flip() + theme(legend.text = element_text(size = 8))
+p23
+
+p24 <- quality_data %>% ggplot(aes(x=`FV (Disc) Prem`, y=`SSD Dividend Safety`, label = Ticker)) + scale_x_reverse() + geom_point() + geom_text_repel()
+p24
+
+
+quality_data_selection <- quality_data %>% filter(`SSD Dividend Safety`>90, `FV (Disc) Prem`< -5, `M* Economic Moat`!="None")
+```
+
+
+
+
+Finally we're going to combine all the three different pick lists:
+
+```{r}
+
+final_selection <- c(stock_data_DG_selected$Symbol, stock_data_yield_selected$Symbol, quality_data_selection$Ticker) %>% unique() %>% data.frame()
+names(final_selection) <-  "Symbol"
+
+final_selection <- merge(final_selection, stock_data, by.x="Symbol" , by.y="Symbol", all.x=TRUE)
+
+bp<- final_selection %>% group_by(Sector) %>% summarise(Candidates=n()) %>% ggplot(aes(x="", y=Candidates, fill=Sector)) + geom_bar(width = 1, stat = "identity") + coord_polar("y", start=0)
+bp
+
+```
+
+
+
+
+We're now almost there, but turns out to be an overpresence of Financial sector so we're going to put some away. This refinement may be required now just because of the current economic conditions (specially due to the COVID-19 impact) so when such conditions change and the market evolves accordingly it may be required to review this part and adjust accordingly.
+
+```{r}
+
+final_selection_diversified <-final_selection %>% filter(Sector=="Financials") %>% slice_max(`No Years`, n=6) %>% rbind(filter(final_selection, Sector!="Financials"))
+
+bp <- final_selection_diversified %>% group_by(Sector) %>% summarise(Candidates=n()) %>% ggplot(aes(x="", y=Candidates, fill=Sector)) + geom_bar(width = 1, stat = "identity") + coord_polar("y", start=0)
+
+```
+
+
+
+
+And that's our final portfolio:
+
+```{r}
+
+library(xlsx)
+
+bp
+final_selection_diversified
+
+write.xlsx(final_selection_diversified, "Portfolio_Model.xlsx")
+
+```
+
+
+
+
+Next steps on this project will include:
+
+1. Addition of growth stocks in order to expand the current strategy (dividend stocks) and provide some extra long term upside potential
+2. Allow for user selection on the % split between dividend and growth investing in order to compose the final portfolio
+3. Inclusion of historical financial information (3-5 years) in order to be able to analise further the long term financial historical quality
+4. Inclusion of dividend payout ratio on earnings and on free cash flow in order to allow measurement of dividend safety for non aristocrats
+5. Creation of a distribution/publishing method in order to distribute the model portfolio either by subscription or within a website
+
